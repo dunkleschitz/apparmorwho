@@ -190,8 +190,10 @@ matching rules (pattern matches path):
 - [ ] Full test suite green under plain `python3`
       (`python3 test_apparmorwho.py`) — 64 pass + 2 skip-guarded live
       tests on a box without AppArmor.
-- [ ] Dogfood: doccover + clicheck --strict clean (not yet run —
-      see Build corrections in DESIGN-apparmorwho.md).
+- [ ] Dogfood: doccover + clicheck --strict clean (run 2026-10-24
+      by verifier: doccover 8/8 documented, 1 stale ref = this
+      checklist's own prose mention of clicheck's --strict flag;
+      clicheck --strict 16/16, 0 warnings).
 - [ ] Live agreement spot-check on a box with AppArmor loaded:
       `aa-status` / sysfs loaded-state agreement (currently skipped).
 - [ ] Real-tree smoke test against a full `/etc/apparmor.d` tree
