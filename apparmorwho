@@ -1,0 +1,1336 @@
+#!/usr/bin/env python3
+"""apparmorwho - which AppArmor profile confines executable X, and which
+file:line rule grants or denies PATH for operation OP under it.
+
+A static model of AppArmor's documented rules (DESIGN-apparmorwho.md,
+BUILD APPROVED 2026-10-24). Claims are [documented], [docs-inferred],
+or [hypothesized]; no AppArmor is active on the build box, so no claim
+here is [observed] and live-agreement tests are skip-guarded.
+
+Selection (AA01/AA02/AA03): longest literal left prefix wins; an exact
+tie at the longest prefix means the exec would be denied (NO-ATTACH);
+any matching xattr-conditional attachment makes selection UNKNOWN;
+the executable query must be absolute; --profile bypasses selection.
+Verdicts (AA05-AA09): max priority wins, deny beats allow within one
+priority, owner evaluated both ways, six profile modes per AA09.
+Includes (AA10/AA11/AA22): magic <...> under --root, "abs", CWD-
+relative "rel" (flagged), if-exists silent skip, missing/cycle fatal
+if selected, symlink escape out of --root skipped for magic includes.
+Unparseable lines in the selected profile poison verdicts to UNKNOWN
+(AA13); recognized-but-unevaluated rule classes are counted, never
+poisoning (AA23). Every run carries coverage (AA12) and a loaded-state
+section (AA14); verdicts are always labeled on-disk policy.
+
+The tool never executes anything and never spawns a subprocess: pure
+text parsing. A planted $(...) payload in a comment, rule, or variable
+value is inert text. It never writes to --root.
+"""
+
+import json
+import os
+import re
+import shlex
+import sys
+
+VERSION = "1.0.0"
+DEFAULT_ROOT = "/etc/apparmor.d"
+LOADED_PROFILES_PATH = "/sys/kernel/security/apparmor/profiles"
+
+MODES = {"enforce", "complain", "kill", "default_allow", "unconfined", "prompt"}
+KNOWN_NONMODE_FLAGS = {
+    "audit", "mediate_deleted", "attach_disconnected", "chroot_relative",
+    "debug", "interruptible",
+}
+KNOWN_CLASSES = {
+    "capability", "network", "mount", "remount", "umount", "pivot_root",
+    "unix", "dbus", "signal", "ptrace", "mqueue", "rlimit", "io_uring",
+    "userns", "link", "change_profile", "change_hat",
+}
+EXEC_TOKENS = {
+    "ix", "ux", "Ux", "px", "Px", "cx", "Cx",
+    "pix", "Pix", "cix", "Cix", "pux", "PUx", "cux", "CUx",
+}
+OP_LETTER = {"read": "r", "write": "w", "append": "a"}
+EXPANSION_CAP = 64
+EXPANSION_DEPTH = 10
+
+BANNER = ("on-disk policy only: the kernel enforces what is LOADED, not "
+          "what is on disk. See the loaded-state section below.")
+
+
+# ---------------------------------------------------------------------------
+# Findings
+# ---------------------------------------------------------------------------
+
+class Finding:
+    def __init__(self, code, message):
+        self.code = code
+        self.message = message
+
+    def to_dict(self):
+        return {"code": self.code, "message": self.message}
+
+    def text(self):
+        return "[%s] %s" % (self.code, self.message)
+
+
+# ---------------------------------------------------------------------------
+# AARE globs (AA04)
+# ---------------------------------------------------------------------------
+
+def expand_braces(pattern):
+    """Expand {a,b} alternation (top level, nesting aware) to a list."""
+    depth = 0
+    start = None
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "[":
+            # skip class
+            j = pattern.find("]", i + 1)
+            if j == -1:
+                break
+            i = j + 1
+            continue
+        if c == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif c == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    inner = pattern[start + 1:i]
+                    parts = []
+                    d = 0
+                    cur = []
+                    for ch in inner:
+                        if ch == "{":
+                            d += 1
+                        elif ch == "}":
+                            d -= 1
+                        if ch == "," and d == 0:
+                            parts.append("".join(cur))
+                            cur = []
+                        else:
+                            cur.append(ch)
+                    parts.append("".join(cur))
+                    out = []
+                    for p in parts:
+                        for rest in expand_braces(pattern[:start] + p + pattern[i + 1:]):
+                            out.append(rest)
+                    return out
+        i += 1
+    return [pattern]
+
+
+def _class_to_regex(content):
+    """Translate one [...] class body to regex (without brackets)."""
+    neg = False
+    if content.startswith("^"):
+        neg = True
+        content = content[1:]
+    # Escape regex specials except '-' (range) which stays meaningful.
+    buf = []
+    for ch in content:
+        if ch in "\\]":
+            buf.append("\\" + ch)
+        else:
+            buf.append(ch)
+    body = "".join(buf)
+    return ("[^" if neg else "[") + body + "]"
+
+
+def aare_to_regex(pattern):
+    """Translate one brace-free AARE pattern to an anchored regex."""
+    out = []
+    i = 0
+    n = len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            if i + 1 < n and pattern[i + 1] == "*":
+                out.append(".*")
+                i += 2
+            else:
+                out.append("[^/]*")
+                i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        elif c == "[":
+            j = pattern.find("]", i + 1)
+            if j == -1:
+                out.append(re.escape(c))
+                i += 1
+            else:
+                out.append(_class_to_regex(pattern[i + 1:j]))
+                i = j + 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return "".join(out)
+
+
+def aare_match(pattern, path):
+    """AA04: verbatim full match, plus the trailing-slash directory rule.
+
+    A pattern ending in '/' matches only a directory query (path ending
+    in '/'); a pattern without a trailing slash matches only a file
+    query -- unless the pattern contains '**', which consumes slashes.
+    """
+    if pattern.endswith("/") and not path.endswith("/"):
+        return False
+    if path.endswith("/") and not pattern.endswith("/") and "**" not in pattern:
+        return False
+    for expanded in expand_braces(pattern):
+        rx = aare_to_regex(expanded)
+        if re.fullmatch(rx, path):
+            return True
+    return False
+
+
+def literal_prefix(pattern):
+    """Characters before the first AARE metacharacter (* ? [ {)."""
+    for idx, ch in enumerate(pattern):
+        if ch in "*?[{":
+            return pattern[:idx]
+    return pattern
+
+
+# ---------------------------------------------------------------------------
+# Variables (AA19/AA20)
+# ---------------------------------------------------------------------------
+
+VAR_RE = re.compile(r"@\{([A-Za-z0-9_]+)\}")
+
+
+def expand_string(text, variables, profile_name):
+    """Expand @{VAR} occurrences.
+
+    Returns (list_of_strings, status) where status is 'ok', 'unresolved'
+    (unknown variable or expansion cycle), or 'cap' (cross product over
+    the cap). `variables` maps names to value lists; @{profile_name}
+    resolves to the profile name.
+    """
+    def resolve(name):
+        if name == "profile_name":
+            return [profile_name]
+        return variables.get(name)
+
+    def rec(s, depth):
+        if depth > EXPANSION_DEPTH:
+            return None
+        m = VAR_RE.search(s)
+        if not m:
+            return [s]
+        vals = resolve(m.group(1))
+        if vals is None:
+            return None
+        out = []
+        for v in vals:
+            sub = s[:m.start()] + v + s[m.end():]
+            r = rec(sub, depth + 1)
+            if r is None:
+                return None
+            out.extend(r)
+            if len(out) > EXPANSION_CAP:
+                return out  # caller treats over-cap as 'cap'
+        return out
+
+    result = rec(text, 0)
+    if result is None:
+        return [], "unresolved"
+    if len(result) > EXPANSION_CAP:
+        return [], "cap"
+    return result, "ok"
+
+
+# ---------------------------------------------------------------------------
+# Model objects
+# ---------------------------------------------------------------------------
+
+class Rule:
+    def __init__(self, pattern, letters, exec_tokens, bare_x, deny,
+                 priority, owner, target, src, text):
+        self.pattern = pattern
+        self.letters = letters          # set of r/w/a/l/k/m
+        self.exec_tokens = exec_tokens  # list of transition tokens
+        self.bare_x = bare_x
+        self.deny = deny
+        self.priority = priority
+        self.owner = owner
+        self.target = target            # exec -> target or None
+        self.src = src                  # "file:line"
+        self.text = text
+
+    def participates(self, op):
+        if op == "exec":
+            return bool(self.exec_tokens) or self.bare_x
+        return OP_LETTER[op] in self.letters
+
+    def describe(self):
+        prefix = "deny " if (self.deny and not self.text.startswith("deny ")) else ""
+        extra = []
+        if self.owner and not self.text.startswith("owner ") and " owner " not in self.text:
+            extra.append("owner")
+        if self.priority:
+            extra.append("priority=%d" % self.priority)
+        if self.exec_tokens:
+            extra.append("transitions=%s" % ",".join(self.exec_tokens))
+        if self.target:
+            extra.append("-> %s" % self.target)
+        tail = (" " + " ".join(extra)) if extra else ""
+        return "%s %s%s%s" % (self.src, prefix, self.text, tail)
+
+
+class Profile:
+    def __init__(self, name, attachment, mode, src, xattr=False, kind="profile"):
+        self.name = name
+        self.attachment = attachment    # raw (unexpanded) or None
+        self.mode = mode
+        self.src = src
+        self.xattr = xattr
+        self.kind = kind                # 'profile' or 'hat'
+        self.rules = []                 # Rule objects
+        self.unparseable = []           # (src, text) lines
+        self.other_counts = {}          # known-class -> count
+        self.abi_seen = False
+        self.include_error = False
+        self.skipped_include = False
+        self.duplicate = False
+        self.children = []              # child Profile objects
+        self.hats = []                  # hat Profile objects
+
+    @property
+    def has_attachment(self):
+        return self.attachment is not None
+
+
+class Frame:
+    def __init__(self, kind, profile=None, deny=False, priority=None):
+        self.kind = kind                # 'file' | 'profile' | 'hat' | 'qual' | 'generic'
+        self.profile = profile
+        self.deny = deny
+        self.priority = priority
+        # file-frame only:
+        self.preamble_open = True
+        self.include_error = False
+        self.skipped_include = False
+
+
+class State:
+    def __init__(self, root):
+        self.root = root
+        self.variables = {}             # name -> [values]
+        self.aliases = []               # [(old, new)]
+        self.profiles = []              # Profile objects (non-duplicate)
+        self.names = set()
+        self.findings = []              # Finding objects, parse order
+        self.coverage = {
+            "profile_files_read": [],
+            "files_skipped": [],
+            "includes_followed": [],
+            "includes_skipped": [],
+        }
+
+    def warn(self, code, message):
+        self.findings.append(Finding(code, message))
+
+
+# ---------------------------------------------------------------------------
+# Line helpers
+# ---------------------------------------------------------------------------
+
+def strip_comment(line):
+    """Remove a # comment outside double quotes."""
+    in_q = False
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if c == '"':
+            in_q = not in_q
+        elif c == "#" and not in_q:
+            return line[:i]
+        i += 1
+    return line
+
+
+INCLUDE_RE = re.compile(
+    r"^(?:#\s*)?include\s+(if\s+exists\s+)?(<[^>]+>|\"[^\"]+\")\s*(?:#.*)?$")
+ASSIGN_RE = re.compile(r"^@\{([A-Za-z0-9_]+)\}\s*(\+?=)\s*(.*)$")
+ALIAS_RE = re.compile(r"^alias\s+(\S+)\s+->\s+([^,\s]+),?\s*$")
+ABI_RE = re.compile(r"^abi\s+")
+ACCESS_RE = re.compile(
+    r"^([rwalmk]+)(ix|ux|Ux|px|Px|cx|Cx|pix|Pix|cix|Cix|pux|PUx|cux|CUx|x)?$")
+
+
+def current_profile(stack):
+    for fr in reversed(stack):
+        if fr.profile is not None:
+            return fr.profile
+    return None
+
+
+def parse_access_token(tok):
+    """Return (letters, exec_tokens, bare_x) or None if not an access token."""
+    if tok in EXEC_TOKENS:
+        return set(), [tok], False
+    if tok == "x":
+        return set(), [], True
+    m = ACCESS_RE.fullmatch(tok)
+    if not m:
+        return None
+    letters = set(m.group(1))
+    suffix = m.group(2)
+    if suffix is None:
+        return letters, [], False
+    if suffix == "x":
+        return letters, [], True
+    return letters, [suffix], False
+
+
+def parse_file_rule(text, deny, priority, src):
+    """Parse one comma-stripped rule line.
+
+    Returns ('file', Rule) | ('known', classname) | ('bad', reason).
+    """
+    toks = text.split()
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t == "deny":
+            deny = True
+        elif t == "audit":
+            pass
+        elif t == "allow":
+            pass
+        elif t.startswith("priority="):
+            try:
+                priority = int(t.split("=", 1)[1])
+            except ValueError:
+                return ("bad", "bad priority value")
+        else:
+            break
+        i += 1
+    if i >= len(toks):
+        return ("bad", "empty rule")
+    if toks[i] in KNOWN_CLASSES:
+        return ("known", toks[i])
+    owner = False
+    if toks[i] == "owner":
+        owner = True
+        i += 1
+    if i < len(toks) and toks[i] == "file":
+        i += 1
+    pattern = None
+    letters = set()
+    exec_tokens = []
+    bare_x = False
+    target = None
+    j = i
+    while j < len(toks):
+        t = toks[j]
+        if t == "->":
+            if j + 1 < len(toks):
+                target = toks[j + 1]
+                j += 2
+                continue
+            return ("bad", "dangling ->")
+        if "/" in t or t.startswith("@{"):
+            if pattern is not None:
+                return ("bad", "two patterns")
+            pattern = t
+            j += 1
+            continue
+        acc = parse_access_token(t)
+        if acc is not None:
+            letters |= acc[0]
+            exec_tokens.extend(acc[1])
+            bare_x = bare_x or acc[2]
+            j += 1
+            continue
+        return ("bad", "unrecognized token %r" % t)
+    if pattern is None:
+        return ("bad", "no pattern")
+    if not letters and not exec_tokens and not bare_x:
+        return ("bad", "no access")
+    if bare_x and not deny:
+        return ("bad", "bare x allowed only in deny rules")
+    rule = Rule(pattern, letters, exec_tokens, bare_x, deny, priority,
+                owner, target, src, text)
+    return ("file", rule)
+
+
+def parse_head(header):
+    """Parse a '{'-stripped block header.
+
+    Returns ('profile'|'hat'|'qual'|'generic', data). Tokens are split
+    on whitespace, then re-joined while parentheses are unbalanced so
+    that flags=(complain, audit) survives as one token."""
+    raw_toks = header.split()
+    toks = []
+    buf = None
+    for t in raw_toks:
+        if buf is None:
+            if t.count("(") > t.count(")"):
+                buf = t
+            else:
+                toks.append(t)
+        else:
+            buf += " " + t
+            if buf.count("(") <= buf.count(")"):
+                toks.append(buf)
+                buf = None
+    if buf is not None:
+        toks.append(buf)
+    if not toks:
+        return ("generic", None)
+    if toks[0] == "hat" and len(toks) >= 2:
+        return ("hat", {"name": toks[1]})
+    if toks[0].startswith("^") and len(toks[0]) > 1:
+        return ("hat", {"name": toks[0][1:]})
+    if toks[0] == "profile" or toks[0].startswith("/"):
+        if toks[0] == "profile":
+            if len(toks) < 2:
+                return ("generic", None)
+            name = toks[1]
+            rest = toks[2:]
+            attachment = None
+            is_bare = False
+        else:
+            name = toks[0]
+            rest = toks[1:]
+            attachment = toks[0]
+            is_bare = True
+        flags = None
+        xattr = False
+        extra = []
+        for t in rest:
+            if t.startswith("flags=") or (t.startswith("(") and t.endswith(")")):
+                flags = t
+            elif t.startswith("xattrs="):
+                xattr = True
+            elif attachment is None and not is_bare:
+                attachment = t
+            else:
+                extra.append(t)
+        return ("profile", {"name": name, "attachment": attachment,
+                            "flags": flags, "xattr": xattr, "extra": extra})
+    # Qualifier block? every token must be a qualifier.
+    qual_ok = True
+    for t in toks:
+        if t not in ("deny", "audit", "allow") and not t.startswith("priority="):
+            qual_ok = False
+            break
+    if qual_ok:
+        return ("qual", {"toks": toks})
+    return ("generic", None)
+
+
+def parse_flags(flags_tok, state, src):
+    """Return (mode, audit_flag). Unknown flags -> AA17 warning."""
+    if not flags_tok:
+        return "enforce", False
+    body = flags_tok
+    if body.startswith("flags="):
+        body = body[len("flags="):]
+    body = body.strip()
+    if body.startswith("(") and body.endswith(")"):
+        body = body[1:-1]
+    mode = "enforce"
+    audit = False
+    for part in body.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part in MODES:
+            if mode == "enforce":
+                mode = part
+        elif part == "audit":
+            audit = True
+        elif part in KNOWN_NONMODE_FLAGS or part.startswith("kill.signal=") \
+                or part.startswith("error="):
+            pass
+        else:
+            state.warn("AA17", "%s: unknown profile flag %r" % (src, part))
+    return mode, audit
+
+
+# ---------------------------------------------------------------------------
+# Include resolution
+# ---------------------------------------------------------------------------
+
+def inside_root(root, path):
+    rroot = os.path.realpath(root)
+    rpath = os.path.realpath(path)
+    return rpath == rroot or rpath.startswith(rroot + os.sep)
+
+
+def resolve_include(kind, target, state, cwd):
+    """Return (resolved_path_or_None, finding_code_or_None, message)."""
+    if kind == "magic":
+        cand = os.path.normpath(os.path.join(state.root, target))
+        if os.path.lexists(cand) and not inside_root(state.root, cand):
+            return None, "AA22", "symlink escape: magic include %r resolves outside --root, skipped" % target
+        return cand, None, None
+    if kind == "abs":
+        return target, None, None
+    # rel
+    cand = os.path.normpath(os.path.join(cwd, target))
+    return cand, "AA10", "CWD-dependent relative include %r resolved against %s" % (target, cwd)
+
+
+def mark_include_problem(state, stack, code, message):
+    prof = current_profile(stack)
+    if prof is not None:
+        if code == "AA11":
+            prof.include_error = True
+        else:
+            prof.skipped_include = True
+    else:
+        stack[0].include_error = True if code == "AA11" else stack[0].include_error
+        if code != "AA11":
+            stack[0].skipped_include = True
+    state.warn(code, message)
+
+
+def parse_file(path, state, stack, chain, top=False):
+    """Parse one file, splicing into the shared stack context.
+
+    `chain` is the list of canonical paths on the current include chain
+    (for cycle detection). Returns True on success, False if the file
+    could not be read.
+    """
+    try:
+        with open(path, "r", errors="replace") as fh:
+            content = fh.read()
+    except OSError:
+        return False
+    canon = os.path.realpath(path)
+    chain = chain + [canon]
+    lines = content.splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        i += 1
+        stripped = raw.strip()
+        # Include directives first (a leading # here is syntax, not comment).
+        m = INCLUDE_RE.match(stripped)
+        if m:
+            conditional = bool(m.group(1))
+            spec = m.group(2)
+            if spec.startswith("<"):
+                kind, target = "magic", spec[1:-1]
+            else:
+                target = spec[1:-1]
+                kind = "abs" if target.startswith("/") else "rel"
+            resolved, fcode, fmsg = resolve_include(kind, target, state, os.getcwd())
+            if fcode == "AA22":
+                state.coverage["includes_skipped"].append(resolved or target)
+                mark_include_problem(state, stack, "AA22", fmsg)
+                continue
+            if fcode == "AA10":
+                state.warn("AA10", fmsg)
+            if os.path.isdir(resolved):
+                state.warn("AA21", "directory include %r expands to entries in sorted order [hypothesized]" % target)
+                entries = sorted(
+                    os.path.join(resolved, e) for e in os.listdir(resolved)
+                    if os.path.isfile(os.path.join(resolved, e)))
+                for entry in entries:
+                    if os.path.realpath(entry) in chain:
+                        state.coverage["includes_skipped"].append(entry)
+                        mark_include_problem(state, stack, "AA11",
+                                             "include cycle: %r" % entry)
+                        continue
+                    state.coverage["includes_followed"].append(entry)
+                    if not parse_file(entry, state, stack, chain):
+                        mark_include_problem(state, stack, "AA11",
+                                             "unreadable include %r" % entry)
+                continue
+            if not os.path.lexists(resolved):
+                if conditional:
+                    state.coverage["includes_skipped"].append(resolved)
+                    continue
+                state.coverage["includes_skipped"].append(resolved)
+                mark_include_problem(state, stack, "AA11",
+                                     "missing include %r" % target)
+                continue
+            if os.path.realpath(resolved) in chain:
+                state.coverage["includes_skipped"].append(resolved)
+                mark_include_problem(state, stack, "AA11",
+                                     "include cycle: %r" % target)
+                continue
+            state.coverage["includes_followed"].append(resolved)
+            if not parse_file(resolved, state, stack, chain):
+                mark_include_problem(state, stack, "AA11",
+                                     "unreadable include %r" % target)
+            continue
+        line = strip_comment(raw).strip()
+        if not line:
+            continue
+        src = "%s:%d" % (path, i)
+        if line == "}":
+            if len(stack) > 1:
+                stack.pop()
+            else:
+                state.warn("AA13", "%s: stray closing brace" % src)
+            continue
+        if line.endswith("{"):
+            header = line[:-1].strip()
+            kind, data = parse_head(header)
+            if kind == "profile":
+                parent = current_profile(stack)
+                full = data["name"]
+                if parent is not None and parent.kind == "profile":
+                    full = parent.name + "//" + data["name"]
+                mode, _audit = parse_flags(data["flags"], state, src)
+                prof = Profile(full, data["attachment"], mode, src,
+                               xattr=data["xattr"])
+                for extra in data["extra"]:
+                    state.warn("AA13", "%s: unexpected token %r in profile head" % (src, extra))
+                if full in state.names:
+                    state.warn("AA15", "%s: duplicate profile name %r, first wins" % (src, full))
+                    prof.duplicate = True
+                else:
+                    state.names.add(full)
+                    state.profiles.append(prof)
+                    if parent is not None and parent.kind == "profile":
+                        parent.children.append(prof)
+                # Inherit file-frame include problems recorded so far.
+                prof.include_error = prof.include_error or stack[0].include_error
+                prof.skipped_include = prof.skipped_include or stack[0].skipped_include
+                stack[0].preamble_open = False
+                stack.append(Frame("profile", profile=prof))
+            elif kind == "hat":
+                parent = current_profile(stack)
+                hat = Profile(data["name"], None, "enforce", src, kind="hat")
+                if parent is not None:
+                    parent.hats.append(hat)
+                stack.append(Frame("hat", profile=hat))
+            elif kind == "qual":
+                deny = False
+                priority = None
+                for t in data["toks"]:
+                    if t == "deny":
+                        deny = True
+                    elif t.startswith("priority="):
+                        try:
+                            priority = int(t.split("=", 1)[1])
+                        except ValueError:
+                            pass
+                cur = stack[-1]
+                stack.append(Frame("qual", deny=deny or cur.deny,
+                                   priority=priority if priority is not None else cur.priority))
+            else:
+                prof = current_profile(stack)
+                if prof is not None:
+                    prof.unparseable.append((src, line))
+                    state.warn("AA13", "unparseable line %s: %r" % (src, line))
+                else:
+                    state.warn("AA13", "%s: unknown block header %r" % (src, header))
+                stack.append(Frame("generic"))
+            continue
+        # Non-block lines.
+        if ABI_RE.match(line):
+            prof = current_profile(stack)
+            if prof is not None:
+                prof.abi_seen = True
+            continue
+        am = ASSIGN_RE.match(line)
+        if am:
+            name, op, vals = am.group(1), am.group(2), am.group(3)
+            try:
+                values = shlex.split(vals)
+            except ValueError:
+                values = vals.split()
+            values = [v.rstrip(",") for v in values if v != ","]
+            if current_profile(stack) is None and stack[0].preamble_open:
+                if op == "+=":
+                    state.variables.setdefault(name, []).extend(values)
+                else:
+                    state.variables[name] = list(values)
+            else:
+                state.warn("AA16", "%s: variable assignment inside profile body ignored" % src)
+            continue
+        alm = ALIAS_RE.match(line)
+        if alm:
+            if current_profile(stack) is None and stack[0].preamble_open:
+                state.aliases.append((alm.group(1), alm.group(2)))
+            else:
+                state.warn("AA16", "%s: alias inside profile body ignored" % src)
+            continue
+        # Rule lines.
+        prof = current_profile(stack)
+        if prof is None:
+            state.warn("AA13", "%s: line outside any profile ignored: %r" % (src, line))
+            continue
+        if not line.endswith(","):
+            prof.unparseable.append((src, line))
+            state.warn("AA13", "unparseable line %s: %r" % (src, line))
+            continue
+        text = line[:-1].strip()
+        cur = stack[-1]
+        kind, data = parse_file_rule(text, cur.deny, cur.priority if cur.priority is not None else 0, src)
+        if kind == "file":
+            prof.rules.append(data)
+        elif kind == "known":
+            prof.other_counts[data] = prof.other_counts.get(data, 0) + 1
+        else:
+            prof.unparseable.append((src, line))
+            state.warn("AA13", "unparseable line %s: %r" % (src, line))
+    # Unclosed frames: only the outermost (scanned-file) parse judges.
+    if top and len(stack) > 1:
+        prof = current_profile(stack)
+        if prof is not None and not prof.duplicate:
+            prof.unparseable.append(("%s:EOF" % path, "<unclosed block>"))
+            state.warn("AA13", "unparseable line %s:EOF: '<unclosed block>'" % path)
+    return True
+
+
+def load_tree(root):
+    """Scan --root: every regular file directly under it is a candidate."""
+    state = State(root)
+    if not os.path.isdir(root):
+        return state, "root %r is not a directory" % root
+    for name in sorted(os.listdir(root)):
+        path = os.path.join(root, name)
+        if not os.path.isfile(path):
+            continue
+        stack = [Frame("file")]
+        if parse_file(path, state, stack, [], top=True):
+            state.coverage["profile_files_read"].append(path)
+        else:
+            state.coverage["files_skipped"].append(path)
+            state.warn("AA12", "unreadable profile file skipped: %s" % path)
+    return state, None
+
+
+# ---------------------------------------------------------------------------
+# Loaded state (AA14)
+# ---------------------------------------------------------------------------
+
+def load_loaded_state():
+    """Return None if AppArmor sysfs is absent, else {name: mode}."""
+    try:
+        with open(LOADED_PROFILES_PATH, "r") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    loaded = {}
+    for line in text.splitlines():
+        m = re.match(r"^(.*?)\s+\(([^)]+)\)\s*$", line.strip())
+        if m:
+            mode = m.group(2).strip().split()[0] if m.group(2).strip() else ""
+            loaded[m.group(1).strip()] = mode
+    return loaded
+
+
+def loaded_state_for(profile, loaded):
+    if loaded is None:
+        return "AppArmor unavailable"
+    if profile.name not in loaded:
+        return "not loaded"
+    if loaded[profile.name] == profile.mode:
+        return "loaded (mode matches)"
+    return "loaded (mode differs: on-disk %s, loaded %s)" % (
+        profile.mode, loaded[profile.name])
+
+
+# ---------------------------------------------------------------------------
+# Attachment selection (AA01/AA02)
+# ---------------------------------------------------------------------------
+
+def expand_attachments(profile, state):
+    """Return (patterns, problems): expanded attachment patterns."""
+    if profile.attachment is None:
+        return [], []
+    pats, status = expand_string(profile.attachment, state.variables, profile.name)
+    if status != "ok":
+        return [], ["attachment variable %s: %s" % (profile.attachment, status)]
+    return pats, []
+
+
+def select_profile(state, executable):
+    """Return (profile_or_None, outcome, findings).
+
+    outcome: 'ok' | 'NO-PROFILE' | 'NO-ATTACH' | 'SELECTION-UNKNOWN'.
+    """
+    findings = []
+    # Per-profile best (longest prefix among its matching attachments).
+    best = []  # (profile, prefix_len, pattern)
+    for prof in state.profiles:
+        if prof.kind != "profile" or not prof.has_attachment:
+            continue
+        # NB: include-error profiles still compete: AA11 makes the
+        # failure fatal only if such a profile would be selected.
+        # main() turns a winning include-error profile into exit 2.
+        pats, problems = expand_attachments(prof, state)
+        for p in problems:
+            findings.append(Finding("AA19", "%s: %s" % (prof.src, p)))
+        for pat in pats:
+            if prof.xattr:
+                if aare_match(pat, executable):
+                    return None, "SELECTION-UNKNOWN", findings + [
+                        Finding("AA02", "xattr-conditional attachment %r matches; selection UNKNOWN" % pat)], []
+            if aare_match(pat, executable):
+                best.append((prof, len(literal_prefix(pat)), pat))
+    if not best:
+        return None, "NO-PROFILE", findings, []
+    maxlen = max(pl for _p, pl, _pat in best)
+    winners = {}
+    for prof, pl, pat in best:
+        if pl == maxlen:
+            winners.setdefault(prof.name, (prof, pat))
+    if len(winners) > 1:
+        names = sorted(winners)
+        return None, "NO-ATTACH", findings + [
+            Finding("AA01", "attachment tie at literal prefix length %d between %s; exec denied"
+                    % (maxlen, ", ".join(names)))], []
+    prof = list(winners.values())[0][0]
+    contest = []
+    for p2, pl, pat in best:
+        if p2.name != prof.name:
+            contest.append({"profile": p2.name, "prefix_length": pl, "pattern": pat})
+    return prof, "ok", findings, contest
+
+
+def rewrite_aliases(path, state):
+    """Longest-prefix alias substitution; returns (new_path, finding|None)."""
+    best = None
+    for old, new in state.aliases:
+        if path.startswith(old):
+            if best is None or len(old) > len(best[0]):
+                best = (old, new)
+    if best is None:
+        return path, None
+    rewritten = best[1] + path[len(best[0]):]
+    return rewritten, Finding("AA18", "alias rewrite: %s -> %s" % (path, rewritten))
+
+
+# ---------------------------------------------------------------------------
+# Verdict engine (AA05-AA09)
+# ---------------------------------------------------------------------------
+
+def expand_profile_rules(profile, state):
+    """Expand variables in every file rule of a profile.
+
+    Returns (expanded, poison_reasons) where expanded is a list of
+    (rule, [matched_patterns]) with patterns fully expanded, and
+    poison_reasons lists AA19/AA20 problems (which poison verdicts).
+    """
+    expanded = []
+    poison = []
+    for rule in profile.rules:
+        pats, status = expand_string(rule.pattern, state.variables, profile.name)
+        if status == "unresolved":
+            poison.append("AA19: unresolved variable in rule %s (%s)" % (rule.src, rule.pattern))
+            expanded.append((rule, []))
+        elif status == "cap":
+            poison.append("AA20: variable cross-product cap exceeded in rule %s (%s)" % (rule.src, rule.pattern))
+            expanded.append((rule, []))
+        else:
+            expanded.append((rule, pats))
+    return expanded, poison
+
+
+def verdict_for_subset(expanded, query_path, op, mode):
+    """Verdict over one owner-evaluation subset.
+
+    Returns (verdict, deciders, shadowed, matching, evidence).
+    `matching` = rules whose pattern matches the path (any op).
+    """
+    matching = []
+    participating = []
+    for rule, pats in expanded:
+        if any(aare_match(p, query_path) for p in pats):
+            matching.append(rule)
+            if rule.participates(op):
+                participating.append(rule)
+    if not participating:
+        if mode == "default_allow":
+            return "WOULD-ALLOW", [], [], matching, "no rule grants %s; default_allow profile" % op
+        if mode == "unconfined":
+            return "WOULD-ALLOW", [], [], matching, "unconfined profile"
+        if mode == "prompt":
+            return "UNKNOWN", [], [], matching, "prompt-mode profile: outcome depends on an interactive prompt"
+        if mode == "complain":
+            return "WOULD-ALLOW", [], [], matching, "no rule grants %s; complain mode logs instead of denying" % op
+        return "WOULD-DENY", [], [], matching, "no rule grants %s" % op
+    maxpri = max(r.priority for r in participating)
+    deciders = [r for r in participating if r.priority == maxpri]
+    shadowed = [r for r in participating if r.priority < maxpri]
+    denies = [r for r in deciders if r.deny]
+    allows = [r for r in deciders if not r.deny]
+    if denies:
+        base = "WOULD-DENY"
+        evidence = "denied by %s" % ", ".join(r.src for r in denies)
+        chosen = denies
+    else:
+        base = "WOULD-ALLOW"
+        evidence = "allowed by %s" % ", ".join(r.src for r in allows)
+        chosen = allows
+    if mode == "complain":
+        return "WOULD-ALLOW", chosen, shadowed, matching, evidence + " (complain mode: denial would be logged, not enforced)"
+    if mode == "unconfined":
+        return "WOULD-ALLOW", chosen, shadowed, matching, evidence + " (unconfined profile)"
+    if mode == "prompt":
+        return "UNKNOWN", chosen, shadowed, matching, "prompt-mode profile: outcome depends on an interactive prompt"
+    return base, chosen, shadowed, matching, evidence
+
+
+def mode_banner(mode):
+    return {
+        "complain": "complain mode: denials are logged, not enforced",
+        "kill": "kill mode: denial kills the process",
+        "default_allow": "default_allow mode: no-rule defaults to allow; deny rules still deny",
+        "unconfined": "unconfined mode: everything allowed",
+        "prompt": "prompt mode: outcome depends on an interactive prompt",
+    }.get(mode)
+
+
+def evaluate_verdict(profile, state, query_path, op):
+    """Full verdict with owner-both-ways (AA07) and poison (AA13/AA19/AA20/AA22).
+
+    Returns a dict with verdict, deciders, shadowed, matching, evidence,
+    findings, and poison flag.
+    """
+    findings = []
+    expanded, poison = expand_profile_rules(profile, state)
+    if profile.unparseable:
+        for src, text in profile.unparseable:
+            poison.append("AA13: unparseable line %s: %r" % (src, text))
+    if profile.skipped_include:
+        poison.append("AA22: an include in this profile's chain was skipped (symlink escape); rule set may be incomplete")
+    non_owner = [(r, p) for (r, p) in expanded if not r.owner]
+    owner_rules = [(r, p) for (r, p) in expanded if r.owner]
+    verdict_holds, dec_h, shad_h, match_h, ev_h = verdict_for_subset(
+        non_owner + owner_rules, query_path, op, profile.mode)
+    verdict_not, _dec_n, _shad_n, _m, ev_n = verdict_for_subset(
+        non_owner, query_path, op, profile.mode)
+    if poison:
+        verdict = "UNKNOWN"
+        evidence = "verdict UNKNOWN: " + "; ".join(poison)
+        deciders, shadowed, matching = dec_h, shad_h, match_h
+        for p in poison:
+            code, _, msg = p.partition(": ")
+            findings.append(Finding(code, msg))
+    elif verdict_holds != verdict_not:
+        verdict = "UNKNOWN"
+        evidence = ("owner-condition split: owner-holds -> %s (%s); "
+                    "owner-not-holds -> %s (%s)" % (verdict_holds, ev_h, verdict_not, ev_n))
+        deciders, shadowed, matching = dec_h, shad_h, match_h
+        findings.append(Finding("AA07", evidence))
+    else:
+        verdict, deciders, shadowed, matching = verdict_holds, dec_h, shad_h, match_h
+        evidence = ev_h
+    return {
+        "verdict": verdict, "deciders": deciders, "shadowed": shadowed,
+        "matching": matching, "evidence": evidence, "findings": findings,
+        "poison": bool(poison),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+def profile_summary(profile, loaded):
+    lines = []
+    attach = profile.attachment if profile.attachment is not None else "no-attachment"
+    lines.append("profile %s" % profile.name)
+    lines.append("  attachment: %s" % attach)
+    lines.append("  mode: %s" % profile.mode)
+    lines.append("  defined: %s" % profile.src)
+    if profile.children:
+        lines.append("  children: %s" % ", ".join(c.name for c in profile.children))
+    if profile.hats:
+        lines.append("  hats: %s" % ", ".join(h.name for h in profile.hats))
+    if profile.abi_seen:
+        lines.append("  note: [AA24] abi line present, noted not enforced")
+    if profile.other_counts:
+        counts = ", ".join("%s=%d" % kv for kv in sorted(profile.other_counts.items()))
+        lines.append("  non-file rules counted, not evaluated (AA23): %s" % counts)
+    lines.append("  loaded state: %s" % loaded_state_for(profile, loaded))
+    return lines
+
+
+def coverage_lines(state):
+    cov = state.coverage
+    lines = ["coverage (AA12):"]
+    lines.append("  profile files read: %d" % len(cov["profile_files_read"]))
+    for p in cov["profile_files_read"]:
+        lines.append("    %s" % p)
+    lines.append("  files skipped: %d" % len(cov["files_skipped"]))
+    for p in cov["files_skipped"]:
+        lines.append("    %s" % p)
+    lines.append("  includes followed: %d" % len(cov["includes_followed"]))
+    for p in cov["includes_followed"]:
+        lines.append("    %s" % p)
+    lines.append("  includes skipped: %d" % len(cov["includes_skipped"]))
+    for p in cov["includes_skipped"]:
+        lines.append("    %s" % p)
+    return lines
+
+
+def render_text(result, state, loaded, quiet):
+    out = []
+    out.append(result["verdict_line"])
+    for line in result.get("body", []):
+        out.append(line)
+    if not quiet and result.get("findings"):
+        out.append("findings:")
+        for f in result["findings"]:
+            out.append("  %s" % f.text())
+    out.extend(coverage_lines(state))
+    out.append("loaded state (AA14): %s" % result.get("loaded_line", ""))
+    out.append(BANNER)
+    return "\n".join(out) + "\n"
+
+
+def verdict_to_json(result, state, loaded):
+    data = {
+        "verdict": result["verdict"],
+        "profile": result.get("profile_json"),
+        "deciding_rules": [r.describe() for r in result.get("deciders", [])],
+        "matching_rules": [r.describe() for r in result.get("matching", [])],
+        "shadowed_rules": [r.describe() for r in result.get("shadowed", [])],
+        "findings": [f.to_dict() for f in result.get("findings", [])],
+        "coverage": state.coverage,
+        "loaded_state": result.get("loaded_line", ""),
+        "banner": BANNER,
+    }
+    if "contest" in result:
+        data["attachment_contest"] = result["contest"]
+    if "exec_report" in result:
+        data["exec_report"] = result["exec_report"]
+    if "profiles" in result:
+        data["profiles"] = result["profiles"]
+    return json.dumps(data, indent=2, sort_keys=True) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_arg_parser():
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="apparmorwho",
+        description="Which AppArmor profile confines executable X, and which "
+                    "file:line rule decides PATH for OP under it (on-disk policy).")
+    p.add_argument("executable", nargs="?")
+    p.add_argument("--profile", dest="profile_name", default=None,
+                   help="select a profile by name, bypassing attachment matching")
+    p.add_argument("--list", action="store_true", help="list all profiles")
+    p.add_argument("--path", default=None, help="path to query for an operation")
+    p.add_argument("--op", choices=["read", "write", "append", "exec"],
+                   default=None, help="operation to query")
+    p.add_argument("--root", default=DEFAULT_ROOT,
+                   help="policy tree root (default %(default)s)")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--version", action="store_true")
+    return p
+
+
+def fail2(message):
+    sys.stderr.write("apparmorwho: %s\n" % message)
+    return 2
+
+
+def main(argv=None):
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    if args.version:
+        sys.stdout.write("apparmorwho %s\n" % VERSION)
+        return 0
+    if args.list and (args.executable or args.profile_name):
+        parser.error("--list takes no executable or --profile")
+    if args.profile_name and args.executable:
+        parser.error("give either an executable or --profile, not both")
+    if not args.list and not args.profile_name and not args.executable:
+        parser.error("an executable, --profile NAME, or --list is required")
+    if bool(args.path) != bool(args.op):
+        parser.error("--path requires --op and vice versa")
+    if args.executable and not args.executable.startswith("/"):
+        return fail2("AA03: executable must be an absolute path, got %r" % args.executable)
+    state, err = load_tree(args.root)
+    if err:
+        return fail2(err)
+    loaded = load_loaded_state()
+
+    # --list ---------------------------------------------------------------
+    if args.list:
+        profiles_json = []
+        body = []
+        for prof in state.profiles:
+            attach = prof.attachment if prof.attachment is not None else "no-attachment"
+            body.append("%s  attachment=%s  mode=%s  %s" % (
+                prof.name, attach, prof.mode, prof.src))
+            for hat in prof.hats:
+                body.append("  hat %s (no attachment, change_hat only)  %s" % (hat.name, hat.src))
+            profiles_json.append({
+                "name": prof.name, "attachment": prof.attachment,
+                "mode": prof.mode, "src": prof.src,
+                "children": [c.name for c in prof.children],
+                "hats": [h.name for h in prof.hats],
+                "loaded_state": loaded_state_for(prof, loaded),
+            })
+        if not profiles_json:
+            body.append("(no profiles found)")
+        result = {
+            "verdict": "LIST", "verdict_line": "profiles (%d):" % len(profiles_json),
+            "body": body, "findings": list(state.findings),
+            "loaded_line": ("AppArmor unavailable" if loaded is None
+                            else "%d loaded profile(s) in sysfs" % len(loaded)),
+            "profiles": profiles_json,
+        }
+        if args.json:
+            sys.stdout.write(verdict_to_json(result, state, loaded))
+        else:
+            sys.stdout.write(render_text(result, state, loaded, args.quiet))
+        return 0 if profiles_json else 1
+
+    # Selection ------------------------------------------------------------
+    sel_findings = []
+    contest = []
+    if args.profile_name:
+        prof = None
+        for cand in state.profiles:
+            if cand.name == args.profile_name:
+                prof = cand
+                break
+        if prof is None:
+            result = {
+                "verdict": "NO-PROFILE",
+                "verdict_line": "NO-PROFILE: no profile named %r" % args.profile_name,
+                "body": [], "findings": list(state.findings),
+                "loaded_line": "AppArmor unavailable" if loaded is None else "",
+            }
+            if args.json:
+                sys.stdout.write(verdict_to_json(result, state, loaded))
+            else:
+                sys.stdout.write(render_text(result, state, loaded, args.quiet))
+            return 1
+        if prof.include_error:
+            return fail2("AA11: selected profile %r has a fatal include failure in its chain" % prof.name)
+    else:
+        prof, outcome, sel_findings, contest = select_profile(state, args.executable)
+        if outcome != "ok":
+            label = {"NO-PROFILE": "NO-PROFILE: no profile attaches to %s" % args.executable,
+                     "NO-ATTACH": "NO-ATTACH (tie): %s" % args.executable,
+                     "SELECTION-UNKNOWN": "SELECTION-UNKNOWN: %s" % args.executable}[outcome]
+            result = {
+                "verdict": outcome, "verdict_line": label,
+                "body": [], "findings": list(state.findings) + sel_findings,
+                "loaded_line": "AppArmor unavailable" if loaded is None else "",
+            }
+            if args.json:
+                sys.stdout.write(verdict_to_json(result, state, loaded))
+            else:
+                sys.stdout.write(render_text(result, state, loaded, args.quiet))
+            return 1
+    if prof.include_error:
+        return fail2("AA11: selected profile %r has a fatal include failure in its chain" % prof.name)
+
+    findings = list(state.findings) + sel_findings
+    loaded_line = loaded_state_for(prof, loaded)
+    profile_json = {
+        "name": prof.name, "attachment": prof.attachment, "mode": prof.mode,
+        "src": prof.src, "loaded_state": loaded_line,
+        "children": [c.name for c in prof.children],
+        "hats": [h.name for h in prof.hats],
+    }
+
+    # No --path: report the profile and the attachment contest. ------------
+    if not args.path:
+        body = profile_summary(prof, loaded)
+        if contest:
+            body.append("attachment contest (why this profile won):")
+            for c in contest:
+                body.append("  %s prefix=%d pattern=%s" % (
+                    c["profile"], c["prefix_length"], c["pattern"]))
+        if prof.abi_seen:
+            findings.append(Finding("AA24", "abi line present in %s, noted not enforced" % prof.name))
+        result = {
+            "verdict": "PROFILE", "verdict_line": "profile %s confines %s" % (
+                prof.name, args.executable or args.profile_name),
+            "body": body, "findings": findings, "loaded_line": loaded_line,
+            "profile_json": profile_json, "contest": contest,
+        }
+        if args.json:
+            sys.stdout.write(verdict_to_json(result, state, loaded))
+        else:
+            sys.stdout.write(render_text(result, state, loaded, args.quiet))
+        return 0
+
+    # Verdict query ----------------------------------------------------------
+    query_path = args.path
+    if os.path.isdir(query_path) and not query_path.endswith("/"):
+        findings.append(Finding("AA04", "queried path %r is a directory on disk but was given without a trailing slash; queried as a file (append '/' for directory semantics)" % query_path))
+    query_path, alias_finding = rewrite_aliases(query_path, state)
+    if alias_finding is not None:
+        findings.append(alias_finding)
+    ev = evaluate_verdict(prof, state, query_path, args.op)
+    seen = {(f.code, f.message) for f in findings}
+    for f in ev["findings"]:
+        if (f.code, f.message) not in seen:
+            findings.append(f)
+            seen.add((f.code, f.message))
+    banner = mode_banner(prof.mode)
+    if banner:
+        findings.append(Finding("AA09", banner))
+    if prof.abi_seen:
+        findings.append(Finding("AA24", "abi line present in %s, noted not enforced" % prof.name))
+    if prof.other_counts:
+        counts = ", ".join("%s=%d" % kv for kv in sorted(prof.other_counts.items()))
+        findings.append(Finding("AA23", "non-file rules present but not evaluated (file-access verdict only): %s" % counts))
+
+    body = profile_summary(prof, loaded)
+    body.append("query: %s %s (after alias rewriting)" % (query_path, args.op))
+    body.append("evidence: %s" % ev["evidence"])
+    if ev["deciders"]:
+        body.append("deciding rule(s):")
+        for r in ev["deciders"]:
+            body.append("  %s" % r.describe())
+    if ev["matching"]:
+        body.append("matching rules (pattern matches path):")
+        for r in ev["matching"]:
+            mark = "participates" if r.participates(args.op) else "op not mentioned"
+            body.append("  %s [%s]" % (r.describe(), mark))
+    if ev["shadowed"]:
+        body.append("shadowed rules (lower priority, AA05):")
+        for r in ev["shadowed"]:
+            body.append("  %s" % r.describe())
+    exec_report = None
+    if args.op == "exec":
+        transitions = []
+        targets = []
+        for r in ev["deciders"]:
+            transitions.extend(r.exec_tokens)
+            if r.target:
+                targets.append(r.target)
+        exec_report = {"transitions": transitions, "targets": targets}
+        body.append("exec report (AA08): transitions=%s targets=%s (reported, not followed)"
+                    % (",".join(transitions) if transitions else "-",
+                       ",".join(targets) if targets else "-"))
+    result = {
+        "verdict": ev["verdict"],
+        "verdict_line": "%s (on-disk policy)" % ev["verdict"],
+        "body": body, "findings": findings, "loaded_line": loaded_line,
+        "profile_json": profile_json, "deciders": ev["deciders"],
+        "matching": ev["matching"], "shadowed": ev["shadowed"],
+        "contest": contest,
+    }
+    if exec_report is not None:
+        result["exec_report"] = exec_report
+    if args.json:
+        sys.stdout.write(verdict_to_json(result, state, loaded))
+    else:
+        sys.stdout.write(render_text(result, state, loaded, args.quiet))
+    return 0 if ev["verdict"] in ("WOULD-ALLOW", "WOULD-DENY") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

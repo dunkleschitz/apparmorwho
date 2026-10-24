@@ -426,3 +426,67 @@ never-executes; symlink-escape guard; JSON fidelity; exit codes
    (AA12) + loaded state (AA14).
 5. Dogfood: doccover + clicheck --strict; bench-audit map extension;
    prepublish-check clean; README + CHANGELOG.
+
+
+## Build corrections (added during v1 build, 2026-10-24)
+
+These refine the design above; none changes a verdict on a well-formed
+tree, but each pins down a case the design left ambiguous. Found by
+tests, not by reasoning alone.
+
+1. **AA11 — include-error profiles still compete for selection.**
+   The first implementation excluded include-error profiles from
+   attachment candidates, which turned "fatal if selected" into
+   NO-PROFILE (exit 1) for a lone broken profile. Corrected: such
+   profiles compete normally, and if one would win, the query exits 2
+   (fatal). A non-winning include-error profile stays a warning only.
+   This matches the design's "fatal if selected / warning otherwise"
+   once "selected" is read as "would be selected by attachment".
+2. **AA22 — symlink-escape guard scoped to magic includes.** The
+   design says "an include resolving outside --root via a symlink is
+   SKIPPED" without distinguishing forms. Implemented for `<magic>`
+   includes only: an absolute include is explicit absolute intent and
+   a relative include is CWD intent by AA10, so "outside --root" is
+   only unexpected for magic includes. Abs/rel includes are followed
+   as written (and still cycle-checked).
+3. **Variables resolve tree-wide, not parse-order-before-use.** All
+   preamble assignments from all scanned files (sorted scan order,
+   include order within a file; last `=` wins, `+=` appends) are
+   collected before any verdict, so a variable defined in a later
+   file still resolves. The real parser is stricter; this is a
+   deliberate not-a-validator leniency (same family as AA13).
+4. **AA13 warnings surface for non-selected profiles too.** The
+   design's coverage contract (AA12) lists warnings, but unparseable
+   lines were only recorded on their profile object — invisible unless
+   that profile was selected. Build fix: every unparseable line also
+   emits a global AA13 warning; when the profile IS selected, the
+   poison finding is deduplicated against it. Verdicts unchanged.
+5. **Child full names use the parent name as written.** A child of
+   `profile par /usr/bin/par` is `par//kid`, not
+   `/usr/bin/par//kid` — the `//` join uses the profile NAME, not
+   its attachment. (A bare-form parent `/usr/bin/par` does yield
+   `/usr/bin/par//kid`, because there name and attachment coincide.)
+6. **Include-problem inheritance is file-frame scoped.** A preamble
+   include failure in a file marks profiles defined later in that
+   file (the flag lives on the file frame and is copied at profile
+   creation); a body include failure marks only that profile. This
+   keeps a broken preamble from silently poisoning profiles in other
+   scanned files.
+7. **Hats via --profile report NO-PROFILE.** Hats are list-only per
+   the design; `--profile <hat-name>` does not select a hat for a
+   verdict (it is not in the profile namespace), it reports
+   NO-PROFILE, exit 1.
+8. **Alias trailing-comma handling.** The alias regex initially let
+   `\S+` swallow the rule's trailing comma (`/new,`), producing a
+   rewrite to `/new,/f`. Fixed by excluding commas from the target
+   capture; aliases are now tested with and without trailing commas.
+9. **Unclosed blocks poison.** A scanned file whose braces never
+   balance marks its innermost profile with an AA13 EOF unparseable
+   line (plus a global warning) instead of silently dropping the
+   trailing rules.
+10. **Left unverified (see README pre-publish checklist).** Dogfood
+    (doccover + clicheck --strict) was not run in this session;
+    live aa-status/sysfs agreement tests skip on this box (no
+    AppArmor); no real `/etc/apparmor.d` tree was exercised (fixture
+    trees only); the directory-include sorted expansion (AA21)
+    remains [hypothesized] as the design states.
