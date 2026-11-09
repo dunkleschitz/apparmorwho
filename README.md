@@ -205,3 +205,7 @@ matching rules (pattern matches path):
       real tree (abs/rel includes are followed by design).
 - [ ] Godsby's per-project publication approval (charter gate) —
       nothing is published without it.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
