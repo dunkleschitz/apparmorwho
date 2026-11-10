@@ -203,7 +203,7 @@ matching rules (pattern matches path):
       [hypothesized]) against the man page or a real parser run.
 - [ ] Confirm the symlink-escape guard's magic-only scope against a
       real tree (abs/rel includes are followed by design).
-- [ ] Godsby's per-project publication approval (charter gate) —
+- [ ] Per-project publication approval (charter gate) —
       nothing is published without it.
 
 ## License
