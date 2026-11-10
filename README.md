@@ -178,7 +178,9 @@ matching rules (pattern matches path):
   [docs-inferred], or [hypothesized] from the apparmor.d(5) man page
   (Ubuntu questing edition, focal cross-checked) — never [observed].
   Live-agreement tests against `aa-status` / sysfs are skip-guarded
-  and skip on this box.
+  and skip wherever they run — no live-agreement harness exists yet
+  (the tests fail-safe to skip rather than fail on AppArmor-present
+  hosts such as CI runners).
 - **Never executes, never writes.** Pure text parsing, stdlib only,
   zero subprocesses in the tool. A planted `$(...)` payload in a
   comment, rule, or variable value is inert text (dedicated test).

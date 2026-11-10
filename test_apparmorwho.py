@@ -499,12 +499,12 @@ class TestOutput(Fixture):
 class TestLiveSkipped(unittest.TestCase):
     def test_aa_status_agreement(self):
         if os.path.exists("/sys/kernel/security/apparmor/profiles"):
-            self.fail("AppArmor present; live agreement test not implemented for this box")
+            self.skipTest("AppArmor present; live agreement test not implemented for this box")
         self.skipTest("AppArmor sysfs absent on this box")
 
     def test_sysfs_loaded_state_agreement(self):
         if os.path.exists("/sys/kernel/security/apparmor/profiles"):
-            self.fail("AppArmor present; live agreement test not implemented for this box")
+            self.skipTest("AppArmor present; live agreement test not implemented for this box")
         self.skipTest("AppArmor sysfs absent on this box")
 
 
